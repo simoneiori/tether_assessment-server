@@ -262,7 +262,7 @@ void *worker_thread(void *arg) {
         	//Not so elegant, we need another solution...
         }
 
-		char pathOnServer[FILENAME_SIZE + 20];
+		char pathOnServer[FILENAME_SIZE + 30];
 		get_path_on_server(pathOnServer, sizeof(pathOnServer), it->filename, c->id);
 
         // Process
@@ -383,7 +383,7 @@ void *data_listener(void *arg) {
 
 		const char *fileName = get_filename(fname);
 
-		char pathOnServer[FILENAME_SIZE + 20];
+		char pathOnServer[FILENAME_SIZE + 30];
 		get_path_on_server(pathOnServer, sizeof(pathOnServer), fileName, client_id);
 
         FILE *f = fopen(pathOnServer, "wb");
@@ -488,7 +488,7 @@ int handle_control_message(int ctrl_fd) {
 	// map filename to saved upload path
 	const char *fileName = get_filename(filepath);
 
-	char pathOnServer[FILENAME_SIZE + 20];
+	char pathOnServer[FILENAME_SIZE + 30];
 	get_path_on_server(pathOnServer, sizeof(pathOnServer), fileName, c->id);
 
 	// create work item using required name and push to queue
