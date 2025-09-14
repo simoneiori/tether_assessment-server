@@ -1,6 +1,6 @@
 PROJECT_ROOT = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OBJS = client.o
+OBJS = server.o
 
 ifeq ($(BUILD_MODE),debug)
 	CFLAGS += -g -O0
@@ -9,8 +9,8 @@ else ifeq ($(BUILD_MODE),run)
 else ifeq ($(BUILD_MODE),profile)
 	CFLAGS += -g -pg -fprofile-arcs -ftest-coverage
 	LDFLAGS += -pg -fprofile-arcs -ftest-coverage
-	EXTRA_CLEAN += client.gcda client.gcno $(PROJECT_ROOT)gmon.out
-	EXTRA_CMDS = rm -rf client.gcda
+	EXTRA_CLEAN += server.gcda server.gcno $(PROJECT_ROOT)gmon.out
+	EXTRA_CMDS = rm -rf server.gcda
 else
     $(error Build mode $(BUILD_MODE) not supported by this Makefile)
 endif
@@ -18,9 +18,9 @@ endif
 	CFLAGS += -pthread
 	LDFLAGS += -pthread
 	
-all:	client
+all:	server
 
-client:	$(OBJS)
+server:	$(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
 	$(EXTRA_CMDS)
 
@@ -31,4 +31,4 @@ client:	$(OBJS)
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) -o $@ $<
 
 clean:
-	rm -fr client $(OBJS) $(EXTRA_CLEAN)
+	rm -fr server $(OBJS) $(EXTRA_CLEAN)
