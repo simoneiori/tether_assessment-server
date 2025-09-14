@@ -1,6 +1,6 @@
 PROJECT_ROOT = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OBJS = server.o
+OBJS = server.o json.o queue.o transform.o
 
 ifeq ($(BUILD_MODE),debug)
 	CFLAGS += -g -O0

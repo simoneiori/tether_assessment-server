@@ -28,169 +28,55 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "jsmn.h"
-
-#define MAX_CONN 128
-#define MAX_CLIENTS 1024
-#define MAX_EVENTS 64
-#define UPLOAD_DIR "uploads"
-#define OUT_DIR "processed"
-#define PRIO_NUM 3
-#define BUF_SIZE 		8192
-#define FILENAME_SIZE 	256
-
-#define MIN_THREADS  4
-#define MAX_THREADS 10
+#include "server.h"
+#include "queue.h"
+#include "json.h"
+#include "transform.h"
 
 
-// supported transform types
-typedef enum {
-	TR_UNKNOWN,
-	TR_NOP,					// No operation, only for testing
-	TR_UPPER,
-	TR_REVERSE,
-	TR_CHECKSUM
-} transform_type_t;
-
-typedef struct {
-    int priority;
-    int client_fd;              		// control fd of client who made the request
-    char filename[FILENAME_SIZE];       // filename of the uploaded file
-    transform_type_t transform;
-} work_item_t;
-
-// Priority queue
-typedef struct pq_node {
-    work_item_t *it;
-    struct pq_node *next;
-} pq_node_t;
-
-typedef struct {
-    pq_node_t *heads[PRIO_NUM];
-    pq_node_t *tails[PRIO_NUM];
-} priority_queue_t;
-
-// Client structure to maintain control+data sockets and pending flags
-typedef struct {
-    int id;
-    int ctrl_fd;
-    int data_fd;    		// data channel fd, set when client uploads
-    int pendingJob;    		// 0 = no outstanding job, 1 = job pending
-    int pendingUpload;    	// 0 = no upload running, 1 = upload is ongoing
-    pthread_mutex_t lock;
-} client_t;
-
-
-// Global variables
-pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
-priority_queue_t *work_queue = NULL;
 
 client_t *clients[MAX_CLIENTS];
 pthread_mutex_t clients_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
-static void set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
 
-// Make sure directories exist
-static void check_dirs() {
+/**
+ * @brief Utils method to make sure that directories exist
+ *
+ * @param path The complete filepath
+ * @return A pointer to the first char of filename
+ */
+void check_dirs() {
     struct stat st;
     if (stat(UPLOAD_DIR, &st) == -1) mkdir(UPLOAD_DIR, 0755);
     if (stat(OUT_DIR, &st) == -1) mkdir(OUT_DIR, 0755);
 }
 
+/**
+ * @brief Utils method to get the filename from the complete filepath
+ *
+ * @param path The complete filepath
+ * @return A pointer to the first char of filename
+ */
 const char * get_filename(const char * path) {
 	const char *base = strrchr(path, '/');
 	base = base ? base + 1 : path;
 	return base;
 }
 
+/**
+ * @brief Get the complete filepath for a file on the server
+ *
+ * @param out The output string which stores the filepath
+ * @param outSize The size of the output buffer
+ * @param filename The string containing the filename
+ * @param id The client ID (which is stored in filename)
+ * @return Nothing
+ */
 void get_path_on_server(char * out, int outSize, const char * filename, int id) {
 	snprintf(out, outSize, "%s/upload_c%d_%s", UPLOAD_DIR, id, filename);
 }
 
-
-// Priority queue functions
-
-/**
- * @brief Initialize the queue
- *
- * @return Nothing
- */
-void pq_init() {
-    work_queue = malloc(sizeof(*work_queue));
-    for (int i = 0; i < PRIO_NUM; i++) {
-		work_queue->heads[i] = work_queue->tails[i] = NULL;
-	}
-}
-
-/**
- * @brief Push an item inside the queue
- *
- * Item are loaded in the pertinent queue according
- * to their priority.
- *
- * @param it Pointer to the item to be added
- * @return Nothing
- */
-void pq_push(work_item_t *it) {
-    if (!it) return;
-
-    if (it->priority < 1) it->priority = 1;
-    if (it->priority > PRIO_NUM) it->priority = PRIO_NUM;
-
-    pq_node_t *n = malloc(sizeof(*n));
-    n->it = it; n->next = NULL;
-
-    pthread_mutex_lock(&queue_lock);
-
-    if (!work_queue->heads[it->priority - 1]) {
-		work_queue->heads[it->priority - 1] = n;
-	}
-    else {
-		work_queue->tails[it->priority - 1]->next = n;
-	}
-	work_queue->tails[it->priority - 1] = n;
-
-    pthread_cond_signal(&queue_cond);
-    pthread_mutex_unlock(&queue_lock);
-}
-
-/**
- * @brief Pop the next item from the queue
- *
- * It implements a simple priority scheme,
- * servicing first the items in the high priority queue.
- *
- * Note: the method is blocking: if no item is available,
- * execution stalls until an item is loaded.
- *
- * @return A pointer to the popped item
- */
-work_item_t *pq_pop_blocking() {
-    pthread_mutex_lock(&queue_lock);
-
-    while (1) {
-        for (int p = 0; p < PRIO_NUM; p++) {					//Pop items according to their priority
-
-            if (work_queue->heads[p]) {
-                pq_node_t *n = work_queue->heads[p];
-                work_queue->heads[p] = n->next;
-                if (!work_queue->heads[p]) {
-					work_queue->tails[p] = NULL;
-				}
-                work_item_t *it = n->it;
-                free(n);
-                pthread_mutex_unlock(&queue_lock);
-                return it;
-            }
-        }
-        pthread_cond_wait(&queue_cond, &queue_lock);
-    }
-}
 
 
 /**
@@ -288,86 +174,6 @@ void unregister_client(int id) {
     pthread_mutex_unlock(&clients_registry_lock);
 }
 
-#define MIN(a,b)	( (a) < (b) ? (a) : (b) )
-#define MAX(a,b)	( (a) > (b) ? (a) : (b) )
-
-/**
- * @brief Parse a string value from a JSON string
- *
- * It looks for the provided key inside the JSON string,
- * and return the found value up to 'outsz' characters.
- *
- * @param s Pointer to the entire JSON string
- * @param key Key we are looking for
- * @param out Pointer to the parse value string, if found. If not found is NULL
- * @param outsz Size of the output buffer
- * @return Nothing
- */
-static void parse_str_field(const char *s, const char *key, char *out, size_t outsz) {
-
-	jsmn_parser parser;
-	jsmntok_t tokens[20]; 		// Array to hold JSON tokens
-
-    jsmn_init(&parser);
-    int ret = jsmn_parse(&parser, s, strlen(s), tokens, 30);
-
-	const char *valPtr;
-    int valLen;
-
-    for (int i = 0; i < ret - 1; i++) {
-	   if ((tokens[i].type == JSMN_STRING) && (tokens[i + 1].type == JSMN_STRING)) {
-		   const char *keyPtr = s + tokens[i].start;
-		   int keyLen = tokens[i].end - tokens[i].start;
-
-		   if (strncmp(keyPtr, key, keyLen) == 0) {
-
-			   valPtr = s + tokens[i + 1].start;
-			   valLen = tokens[i + 1].end - tokens[i + 1].start;
-
-			   int maxLen = MIN(outsz - 1, valLen);
-			   strncpy (out, valPtr, maxLen);
-			   out[maxLen] = '\0';
-			   return;
-		   }
-	   }
-    }
-
-    out[0] = '\0';
-}
-
-/**
- * @brief Parse an integer value from a JSON string
- *
- * It looks for the provided key inside the JSON string,
- * and return the found value.
- *
- * @param s Pointer to the entire JSON string
- * @param key Key we are looking for
- * @return The parse value on success, -1 if value is not found.
- */
-static int parse_int_field(const char *s, const char *key) {
-
-	jsmn_parser parser;
-	jsmntok_t tokens[20]; 		// Array to hold JSON tokens
-
-    jsmn_init(&parser);
-    int ret = jsmn_parse(&parser, s, strlen(s), tokens, 30);
-
-    for (int i = 0; i < ret - 1; i++) {
-	   if ((tokens[i].type == JSMN_STRING) && (tokens[i + 1].type == JSMN_PRIMITIVE)) {
-		   const char *keyPtr = s + tokens[i].start;
-		   int keyLen = tokens[i].end - tokens[i].start;
-
-		   if (strncmp(keyPtr, key, keyLen) == 0) {
-			   const char *valPtr = s + tokens[i + 1].start;
-			   return strtol (valPtr, NULL, 10);
-		   }
-	   }
-    }
-
-    return -1;
-}
-
 
 /**
  * @brief Decode the received transform string
@@ -390,163 +196,6 @@ static transform_type_t parse_transform_field(const char *s) {
     return TR_UNKNOWN;
 }
 
-// Elaborations on files
-
-/**
- * @brief Calculates the checksum on the provided file
- *
- * The function works on the provided filepath, loading the
- * file from the disk and calculating the checksum.
- *
- * @param path Filepath of input file
- * @return The calculated checksum, 0 in case of errors
- */
-unsigned long calc_checksum(const char *path) {
-
-    unsigned long sum = 0;
-
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-
-    unsigned char buf[4096];
-    size_t r;
-    while ((r = fread(buf, 1, sizeof(buf), f)) > 0) {
-        for (size_t i = 0; i < r; i++) sum += buf[i];
-    }
-
-    fclose(f);
-    return sum;
-}
-
-/**
- * @brief Converts the content of a file to uppercase
- *
- * @param in Filepath of input file
- * @param out Filepath of output file
- * @return Nothing
- */
-void transform_upper(const char *in, const char *out) {
-
-    FILE *fi = fopen(in, "rb");
-    FILE *fo = fopen(out, "wb");
-
-    if (!fi || !fo) { if (fi) fclose(fi); if (fo) fclose(fo); return; }
-
-    int c;
-    while ((c = fgetc(fi)) != EOF) fputc(toupper(c), fo);
-
-    fclose(fi); fclose(fo);
-}
-
-/**
- * @brief Reverts the content of a file
- *
- * @param in Filepath of input file
- * @param out Filepath of output file
- * @return Nothing
- */
-void transform_reverse_file(const char *in, const char *out) {
-
-    FILE *fi = fopen(in, "rb");
-    FILE *fo = fopen(out, "wb");
-
-    if (!fi || !fo) { if (fi) fclose(fi); if (fo) fclose(fo); return; }
-
-    fseek(fi, 0, SEEK_END);
-    long sz = ftell(fi);
-    for (long pos = sz - 1; pos >= 0; pos--) {
-        fseek(fi, pos, SEEK_SET);
-        int c = fgetc(fi);
-        fputc(c, fo);
-    }
-
-    fclose(fi); fclose(fo);
-}
-
-/**
- * @brief Dummy operation
- *
- * It simply copies the file without changing it
- *
- * @param in Filepath of input file
- * @param out Filepath of output file
- * @return Nothing
- */
-void transform_nop_file(const char *in, const char *out) {
-
-    FILE *fi = fopen(in, "rb");
-    FILE *fo = fopen(out, "wb");
-
-    if (!fi || !fo) { if (fi) fclose(fi); if (fo) fclose(fo); return; }
-
-    int c;
-    while ((c = fgetc(fi)) != EOF) fputc(c, fo);
-
-    fclose(fi); fclose(fo);
-}
-
-
-// TODO The following methods could be optimized with a variadic function
-
-/**
- * @brief Send JSON string (1 string value)
- *
- * Format the JSON string according to the provided parameters,
- * and send it on the socket.
- *
- * @param fd Descriptor of the socket
- * @param key JSON key
- * @param val JSON value
- * @return Nothing
- */
-void send_json_string(int fd, const char *key, const char *val) {
-
-	char buff[64];
-	snprintf(buff, sizeof(buff), "{\"%s\":\"%s\"}", key, val);
-
-    send(fd, buff, strlen(buff), 0);
-}
-
-/**
- * @brief Send JSON string (1 longint value)
- *
- * Format the JSON string according to the provided parameters,
- * and send it on the socket.
- *
- * @param fd Descriptor of the socket
- * @param key JSON key
- * @param val JSON value
- * @return Nothing
- */
-void send_json_long(int fd, const char *key, long val) {
-
-	char buff[64];
-	snprintf(buff, sizeof(buff), "{\"%s\":%ld}", key, val);
-
-    send(fd, buff, strlen(buff), 0);
-}
-
-/**
- * @brief Send JSON string (1 string value + 1 longint value)
- *
- * Format the JSON string according to the provided parameters,
- * and send it on the socket.
- *
- * @param fd Descriptor of the socket
- * @param key1 JSON key
- * @param val1 JSON value
- * @param key2 JSON key
- * @param val2 JSON value
- * @return Nothing
- */
-void send_json_string_long(int fd, const char *key1, const char *val1, const char *key2, long val2) {
-
-	char buff[64];
-	snprintf(buff, sizeof(buff), "{\"%s\":\"%s\",\"%s\":%ld}", key1, val1, key2, val2);
-
-    send(fd, buff, strlen(buff), 0);
-}
-
 
 /**
  * @brief Send a file
@@ -564,7 +213,11 @@ void send_file(int fd, const char *path) {
     if (stat(path, &st) != 0) return;
 
     // Send the header
-    send_json_long(fd, "filesize", (long)st.st_size);    send(fd, "\n", 1, 0);
+	char buff[64];
+    format_json_long(buff, sizeof(buff), "filesize", (long)st.st_size);
+
+    send(fd, buff, strlen(buff), 0);
+    send(fd, "\n", 1, 0);
 
 
     // Send the raw bytes
@@ -596,6 +249,7 @@ void *worker_thread(void *arg) {
     (void)arg;
 
     while (1) {
+		char buff[64];
         work_item_t *it = pq_pop_blocking();
         if (!it) continue;
 
@@ -617,7 +271,8 @@ void *worker_thread(void *arg) {
 			case TR_CHECKSUM:
 			{
 				unsigned long chk = calc_checksum(pathOnServer);
-				send_json_string_long(c->ctrl_fd, "result", "checksum", "value", chk);
+				format_json_string_long(buff, sizeof(buff), "result", "checksum", "value", chk);
+			    send(c->ctrl_fd, buff, strlen(buff), 0);
 				break;
 			}
 
@@ -645,7 +300,8 @@ void *worker_thread(void *arg) {
 				}
 
 				// notify on ctrl channel...
-				send_json_string(c->ctrl_fd, "result", "file");
+				format_json_string(buff, sizeof(buff), "result", "file");
+			    send(c->ctrl_fd, buff, strlen(buff), 0);
 				// ...and send via data channel
 				send_file(c->data_fd, outpath);
 				break;
@@ -655,7 +311,8 @@ void *worker_thread(void *arg) {
 			case TR_UNKNOWN:
 			{
 				//send error message
-				send_json_string(c->ctrl_fd, "status", "UNKNOWN_OP");
+				format_json_string(buff, sizeof(buff), "status", "UNKNOWN_OP");
+			    send(c->ctrl_fd, buff, strlen(buff), 0);
 				break;
 			}
         }
@@ -752,7 +409,9 @@ void *data_listener(void *arg) {
 
 
         // notify via ctrl channel the end of operation
-		send_json_string(c->ctrl_fd, "status", "UPLOAD_COMPLETE");
+		char buff[64];
+		format_json_string(buff, sizeof(buff), "status", "UPLOAD_COMPLETE");
+	    send(c->ctrl_fd, buff, strlen(buff), 0);
 
         // loop to accept next connection
     }
@@ -781,6 +440,7 @@ void *data_listener(void *arg) {
 int handle_control_message(int ctrl_fd) {
 
     char buf[FILENAME_SIZE + 128];
+	char reply[64];
 
     int n = recv(ctrl_fd, buf, sizeof(buf)-1, 0);
     if (n <= 0) return -1;
@@ -792,8 +452,10 @@ int handle_control_message(int ctrl_fd) {
     char cmd[10];
     parse_str_field(buf, "cmd", cmd, sizeof(cmd));
 
+
     if (strcmp(cmd, "request") != 0) {
-    	send_json_string(c->ctrl_fd, "status", "UNKNOWN_CMD");
+    	format_json_string(reply, sizeof(reply), "status", "UNKNOWN_CMD");
+	    send(c->ctrl_fd, reply, strlen(reply), 0);
         return -1;
     }
 
@@ -801,7 +463,8 @@ int handle_control_message(int ctrl_fd) {
 
 	if (c->pendingJob) {
 		pthread_mutex_unlock(&c->lock);
-		send_json_string(c->ctrl_fd, "status", "BUSY");
+		format_json_string(reply, sizeof(reply), "status", "BUSY");
+	    send(c->ctrl_fd, reply, strlen(reply), 0);
 		return -1;
 	}
 
@@ -816,7 +479,8 @@ int handle_control_message(int ctrl_fd) {
 	int pr = parse_int_field(buf, "priority");
 
 	if (tr == TR_UNKNOWN) {
-    	send_json_string(c->ctrl_fd, "status", "UNKNOWN_OP");
+    	format_json_string(reply, sizeof(reply), "status", "UNKNOWN_OP");
+	    send(c->ctrl_fd, reply, strlen(reply), 0);
         return -1;
 	}
 
@@ -836,7 +500,8 @@ int handle_control_message(int ctrl_fd) {
 	it->transform = tr;
 	pq_push(it);
 
-	send_json_string(c->ctrl_fd, "status", "ENQUEUED");
+	format_json_string(reply, sizeof(reply), "status", "ENQUEUED");
+    send(c->ctrl_fd, reply, strlen(reply), 0);
 
 	return 0;
 }
@@ -927,7 +592,9 @@ int main(int argc, char **argv) {
                 int cfd = accept(listenfd, NULL, NULL);
                 if (cfd < 0) continue;
 
-                set_nonblocking(cfd);
+                // set connection as non blocking
+                int flags = fcntl(cfd, F_GETFL, 0);
+                fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
 
                 int cid = register_client(cfd);
                 if (cid < 0) { close(cfd); continue; }
@@ -937,7 +604,9 @@ int main(int argc, char **argv) {
                 epoll_ctl(efd, EPOLL_CTL_ADD, cfd, &ev);
 
                 // send assigned id to client
-                send_json_long(cfd, "client_id", cid);
+				char buff[64];
+                format_json_long(buff, sizeof(buff), "client_id", cid);
+                send(cfd, buff, strlen(buff), 0);
 
             } else {
 
